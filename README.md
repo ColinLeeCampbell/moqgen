@@ -52,10 +52,11 @@ moqgen subscribe \
   --relay https://localhost:4443 \
   --insecure \
   --broadcast moqgen/test \
+  --tracks 3 \
   --validate
 ```
 
-`--validate` enables sequence gap detection and frame size checking.
+`--tracks N` subscribes to `track-0` through `track-N-1`, matching the publisher convention. `--validate` enables sequence gap detection and frame size checking.
 
 ### Probe
 
@@ -105,7 +106,7 @@ moqgen probe --relay https://localhost:4443 --insecure --output json \
 |---|---|---|
 | `--relay` | — | Relay URL (required) |
 | `--broadcast` | `moqgen/test` | Broadcast path |
-| `--tracks` | `track-0` | Track names (repeatable) |
+| `--tracks` | `1` | Number of tracks to subscribe to (track-0 .. track-N-1) |
 | `--duration` | `10` | Run duration in seconds |
 | `--validate` | false | Sequence + frame size validation |
 | `--frame-size` | `0` | Expected frame size for validation (0 = skip) |
