@@ -53,10 +53,11 @@ moqgen subscribe \
   --insecure \
   --broadcast moqgen/test \
   --tracks 3 \
-  --validate
+  --validate \
+  --frame-size 1024
 ```
 
-`--tracks N` subscribes to `track-0` through `track-N-1`, matching the publisher convention. `--validate` enables sequence gap detection and frame size checking.
+`--tracks N` subscribes to `track-0` through `track-N-1`, matching the publisher convention. `--validate` enables sequence gap detection and, when `--frame-size` is non-zero, verifies that every received frame is exactly that many bytes.
 
 ### Probe
 
