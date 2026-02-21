@@ -20,7 +20,8 @@ pub struct PublishConfig {
 pub struct SubscribeConfig {
     pub relay: Url,
     pub broadcast: String,
-    pub track_names: Vec<String>,
+    /// Number of tracks to subscribe to (track-0 .. track-N-1)
+    pub tracks: usize,
     pub duration_secs: u64,
     pub validate: bool,
     pub insecure: bool,

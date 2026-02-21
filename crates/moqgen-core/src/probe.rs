@@ -103,13 +103,10 @@ impl ProbeWorker {
         });
 
         // --- Subscriber task (uses SubscriberWorker with latency measurement) ---
-        let track_names: Vec<String> =
-            (0..self.config.tracks).map(|i| format!("track-{i}")).collect();
-
         let sub_config = SubscribeConfig {
             relay: url.clone(),
             broadcast: self.config.broadcast.clone(),
-            track_names,
+            tracks: self.config.tracks,
             duration_secs: self.config.duration_secs,
             validate: false,
             insecure: self.config.insecure,

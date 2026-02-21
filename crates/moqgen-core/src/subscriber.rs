@@ -63,11 +63,9 @@ impl SubscriberWorker {
 
         info!("subscribed to broadcast '{}'", self.config.broadcast);
 
-        let track_names = if self.config.track_names.is_empty() {
-            vec!["track-0".to_string()]
-        } else {
-            self.config.track_names.clone()
-        };
+        let track_names: Vec<String> = (0..self.config.tracks.max(1))
+            .map(|i| format!("track-{i}"))
+            .collect();
 
         let mut handles = Vec::new();
         for track_name in track_names {

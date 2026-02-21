@@ -20,9 +20,9 @@ pub struct SubscribeArgs {
     #[arg(long, default_value = "moqgen/test")]
     pub broadcast: String,
 
-    /// Track names to subscribe (can be specified multiple times)
-    #[arg(long, value_name = "NAME")]
-    pub tracks: Vec<String>,
+    /// Number of tracks to subscribe to (track-0 .. track-N-1)
+    #[arg(long, default_value_t = 1)]
+    pub tracks: usize,
 
     /// Run duration in seconds
     #[arg(long, default_value_t = 10)]
@@ -55,7 +55,7 @@ pub async fn run(args: SubscribeArgs) -> anyhow::Result<()> {
     let config = SubscribeConfig {
         relay: args.relay.clone(),
         broadcast: args.broadcast.clone(),
-        track_names: args.tracks.clone(),
+        tracks: args.tracks,
         duration_secs: args.duration,
         validate: args.validate,
         insecure: args.insecure,
