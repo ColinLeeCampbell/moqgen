@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "crates/moqgen-core",
+    "crates/moqgen",
+]
+resolver = "2"
+
+[workspace.dependencies]
+moq-lite   = { git = "https://github.com/kixelated/moq-rs", package = "moq-lite" }
+moq-native = { git = "https://github.com/kixelated/moq-rs", package = "moq-native" }
+tokio       = { version = "1", features = ["full"] }
+clap        = { version = "4", features = ["derive"] }
+bytes       = "1"
+anyhow      = "1"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+hdrhistogram = "7"
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url         = "2"

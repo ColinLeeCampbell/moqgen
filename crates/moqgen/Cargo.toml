@@ -1,0 +1,20 @@
+[package]
+name = "moqgen"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "moqgen"
+path = "src/main.rs"
+
+[dependencies]
+moqgen-core = { path = "../moqgen-core" }
+moq-native  = { workspace = true }
+tokio       = { workspace = true }
+clap        = { workspace = true }
+anyhow      = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true }
+url         = { workspace = true }
