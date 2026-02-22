@@ -59,6 +59,33 @@ moqgen subscribe \
 
 `--tracks N` subscribes to `track-0` through `track-N-1`, matching the publisher convention. `--validate` enables sequence gap detection and, when `--frame-size` is non-zero, verifies that every received frame is exactly that many bytes.
 
+### Static file round-trip
+
+Publish real files from a directory and reconstruct them on the subscriber side for visual comparison:
+
+```bash
+mkdir -p /tmp/assets /tmp/received
+echo "hello moq" > /tmp/assets/hello.txt
+
+# Subscribe first (background)
+moqgen subscribe \
+  --relay https://localhost:4443 --insecure \
+  --static-dir /tmp/assets \
+  --output-dir /tmp/received \
+  --duration 15 &
+
+# Publish
+moqgen publish \
+  --relay https://localhost:4443 --insecure \
+  --static-dir /tmp/assets \
+  --duration 10
+
+# Compare
+diff /tmp/assets/hello.txt /tmp/received/hello.txt
+```
+
+Each file in `--static-dir` becomes one MoQ track named after the filename. The publisher loops through the files until `--duration` expires, sending one group per iteration with the file chunked into `--frame-size`-byte frames. The subscriber concatenates all frames from each group and writes the result to `--output-dir/{filename}`, overwriting on each new group so you always see the latest received copy.
+
 ### Probe
 
 Measure round-trip latency through the relay (publisher + subscriber in one command):
@@ -100,6 +127,7 @@ moqgen probe --relay https://localhost:4443 --insecure --output json \
 | `--insecure` | false | Skip TLS verification |
 | `--output` | `text` | `text` or `json` |
 | `--metrics-interval` | `1` | Stats print interval in seconds |
+| `--static-dir` | — | Serve files from this directory; each file becomes one track named after its filename. Overrides `--tracks`. |
 
 ### `subscribe`
 
@@ -114,6 +142,8 @@ moqgen probe --relay https://localhost:4443 --insecure --output json \
 | `--insecure` | false | Skip TLS verification |
 | `--output` | `text` | `text` or `json` |
 | `--metrics-interval` | `1` | Stats print interval in seconds |
+| `--static-dir` | — | Discover track names from filenames in this directory (instead of `--tracks`) |
+| `--output-dir` | — | Write each received track to a file in this directory |
 
 ### `probe`
 
