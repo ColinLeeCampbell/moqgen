@@ -113,6 +113,8 @@ impl ProbeWorker {
             output: OutputFormat::Text,
             metrics_interval_secs: self.config.metrics_interval_secs,
             frame_size: frame_size,
+            static_dir: None,
+            output_dir: None,
         };
 
         let sub_worker = SubscriberWorker::new(sub_config, Arc::clone(&self.sub_metrics))

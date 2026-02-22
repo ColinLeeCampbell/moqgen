@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -54,6 +55,11 @@ pub struct PublishArgs {
     /// Print stats every N seconds
     #[arg(long, default_value_t = 1)]
     pub metrics_interval: u64,
+
+    /// Publish files from this directory; each file becomes one track
+    /// named after its filename. Overrides --tracks.
+    #[arg(long, value_name = "PATH")]
+    pub static_dir: Option<PathBuf>,
 }
 
 pub async fn run(args: PublishArgs) -> anyhow::Result<()> {
@@ -72,6 +78,7 @@ pub async fn run(args: PublishArgs) -> anyhow::Result<()> {
         payload_type: PayloadType::Random,
         output: output.clone(),
         metrics_interval_secs: args.metrics_interval,
+        static_dir: args.static_dir.clone(),
     };
 
     let metrics = Arc::new(PublishMetrics::default());

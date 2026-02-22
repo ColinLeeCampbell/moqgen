@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use url::Url;
 
 #[derive(Clone, Debug)]
@@ -14,6 +16,9 @@ pub struct PublishConfig {
     pub payload_type: PayloadType,
     pub output: OutputFormat,
     pub metrics_interval_secs: u64,
+    /// Serve files from this directory; each file becomes one track.
+    /// When set, overrides `tracks` and uses filenames as track names.
+    pub static_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -29,6 +34,10 @@ pub struct SubscribeConfig {
     pub metrics_interval_secs: u64,
     /// Expected frame size for validation (0 = skip size check)
     pub frame_size: usize,
+    /// Discover track names from filenames in this directory.
+    pub static_dir: Option<PathBuf>,
+    /// Write each received track to a file in this directory.
+    pub output_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]

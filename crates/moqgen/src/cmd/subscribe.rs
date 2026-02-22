@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -47,6 +48,14 @@ pub struct SubscribeArgs {
     /// Print stats every N seconds
     #[arg(long, default_value_t = 1)]
     pub metrics_interval: u64,
+
+    /// Discover track names from filenames in this directory.
+    #[arg(long, value_name = "PATH")]
+    pub static_dir: Option<PathBuf>,
+
+    /// Write each received track to a file in this directory.
+    #[arg(long, value_name = "PATH")]
+    pub output_dir: Option<PathBuf>,
 }
 
 pub async fn run(args: SubscribeArgs) -> anyhow::Result<()> {
@@ -62,6 +71,8 @@ pub async fn run(args: SubscribeArgs) -> anyhow::Result<()> {
         output: output.clone(),
         metrics_interval_secs: args.metrics_interval,
         frame_size: args.frame_size,
+        static_dir: args.static_dir.clone(),
+        output_dir: args.output_dir.clone(),
     };
 
     let metrics = Arc::new(SubscribeMetrics::default());

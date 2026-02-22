@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use bytes::Bytes;
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -10,6 +11,7 @@ use crate::config::SubscribeConfig;
 use crate::generator::read_timestamp_us;
 use crate::metrics::{LatencyHistogram, SubscribeMetrics};
 use crate::publisher::build_client;
+use crate::static_files::list_static_dir;
 
 pub struct SubscriberWorker {
     pub config: SubscribeConfig,
@@ -63,9 +65,21 @@ impl SubscriberWorker {
 
         info!("subscribed to broadcast '{}'", self.config.broadcast);
 
-        let track_names: Vec<String> = (0..self.config.tracks.max(1))
-            .map(|i| format!("track-{i}"))
-            .collect();
+        // Resolve track names: from static dir filenames or synthetic "track-{i}"
+        let track_names: Vec<String> = if let Some(ref dir) = self.config.static_dir {
+            list_static_dir(dir)
+                .with_context(|| format!("list static dir '{}'", dir.display()))?
+        } else {
+            (0..self.config.tracks.max(1))
+                .map(|i| format!("track-{i}"))
+                .collect()
+        };
+
+        // Ensure output directory exists if configured
+        if let Some(ref out_dir) = self.config.output_dir {
+            std::fs::create_dir_all(out_dir)
+                .with_context(|| format!("create output dir '{}'", out_dir.display()))?;
+        }
 
         let mut handles = Vec::new();
         for track_name in track_names {
@@ -75,6 +89,7 @@ impl SubscriberWorker {
             let latency = self.latency.clone();
             let validate = self.config.validate;
             let expected_frame_size = self.config.frame_size;
+            let output_dir = self.config.output_dir.clone();
 
             handles.push(tokio::spawn(async move {
                 let mut last_seq: Option<u64> = None;
@@ -115,6 +130,13 @@ impl SubscriberWorker {
                     last_seq = Some(seq);
                     metrics.groups_total.fetch_add(1, Ordering::Relaxed);
 
+                    // Accumulate frames for file writing if output_dir is set
+                    let mut group_frames: Vec<Bytes> = if output_dir.is_some() {
+                        Vec::new()
+                    } else {
+                        Vec::new() // empty but we won't populate it when not needed
+                    };
+
                     loop {
                         let frame = match group.read_frame().await {
                             Ok(Some(f)) => f,
@@ -152,6 +174,27 @@ impl SubscriberWorker {
                         let frame_len = frame.len() as u64;
                         metrics.frames_total.fetch_add(1, Ordering::Relaxed);
                         metrics.bytes_total.fetch_add(frame_len, Ordering::Relaxed);
+
+                        if output_dir.is_some() {
+                            group_frames.push(frame);
+                        }
+                    }
+
+                    // Write reconstructed file after group is fully received
+                    if let Some(ref out_dir) = output_dir {
+                        let total_len: usize = group_frames.iter().map(|b| b.len()).sum();
+                        let mut file_data = Vec::with_capacity(total_len);
+                        for chunk in &group_frames {
+                            file_data.extend_from_slice(chunk);
+                        }
+                        let out_path = out_dir.join(&track_name);
+                        if let Err(e) = std::fs::write(&out_path, &file_data) {
+                            warn!(
+                                "failed to write '{}': {e}",
+                                out_path.display()
+                            );
+                            metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }));

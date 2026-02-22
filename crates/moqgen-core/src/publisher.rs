@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use bytes::Bytes;
 use tokio::time::Instant;
 use tracing::{debug, warn};
 use url::Url;
@@ -10,6 +11,7 @@ use url::Url;
 use crate::config::PublishConfig;
 use crate::generator::FrameGenerator;
 use crate::metrics::PublishMetrics;
+use crate::static_files::load_static_dir;
 
 pub struct PublisherWorker {
     pub config: PublishConfig,
@@ -33,12 +35,24 @@ impl PublisherWorker {
             .create_broadcast(&self.config.broadcast)
             .with_context(|| format!("invalid broadcast path '{}'", self.config.broadcast))?;
 
+        // Build (track_name, file_bytes_or_None) pairs depending on mode
+        let track_entries: Vec<(String, Option<Bytes>)> = if let Some(ref dir) = self.config.static_dir {
+            let files = load_static_dir(dir)
+                .with_context(|| format!("load static dir '{}'", dir.display()))?;
+            files.into_iter().map(|(name, bytes)| (name, Some(bytes))).collect()
+        } else {
+            (0..self.config.tracks)
+                .map(|i| (format!("track-{i}"), None))
+                .collect()
+        };
+
         // Pre-create all tracks in the broadcast
-        let mut track_producers: Vec<moq_lite::TrackProducer> =
-            Vec::with_capacity(self.config.tracks);
-        for i in 0..self.config.tracks {
-            let track = moq_lite::Track::new(format!("track-{i}"));
-            track_producers.push(broadcast.create_track(track));
+        let mut track_producers: Vec<(String, Option<Bytes>, moq_lite::TrackProducer)> =
+            Vec::with_capacity(track_entries.len());
+        for (name, bytes) in track_entries {
+            let track = moq_lite::Track::new(name.clone());
+            let producer = broadcast.create_track(track);
+            track_producers.push((name, bytes, producer));
         }
 
         // Connect to the relay and start the session
@@ -54,32 +68,56 @@ impl PublisherWorker {
 
         // Spawn one task per track
         let mut handles = Vec::with_capacity(track_producers.len());
-        for mut track_producer in track_producers {
+        for (_track_name, file_bytes, mut track_producer) in track_producers {
             let metrics = Arc::clone(&self.metrics);
             let config = self.config.clone();
 
             handles.push(tokio::spawn(async move {
-                let mut generator =
-                    FrameGenerator::new(config.frame_size, config.payload_type.clone());
+                if let Some(file_bytes) = file_bytes {
+                    // Static mode: loop sending file content chunked into frame_size groups
+                    loop {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
 
-                loop {
-                    if Instant::now() >= deadline {
-                        break;
+                        let mut group = track_producer.append_group();
+                        for chunk in file_bytes.chunks(config.frame_size.max(1)) {
+                            let frame = Bytes::copy_from_slice(chunk);
+                            let frame_len = frame.len() as u64;
+                            group.write_frame(frame);
+                            metrics.frames_total.fetch_add(1, Ordering::Relaxed);
+                            metrics.bytes_total.fetch_add(frame_len, Ordering::Relaxed);
+                        }
+                        group.close();
+                        metrics.groups_total.fetch_add(1, Ordering::Relaxed);
+
+                        tokio::time::sleep(interval).await;
                     }
+                } else {
+                    // Synthetic mode: existing behaviour
+                    let mut generator =
+                        FrameGenerator::new(config.frame_size, config.payload_type.clone());
 
-                    let mut group = track_producer.append_group();
-                    for _ in 0..config.group_size {
-                        let frame = generator.generate();
-                        let frame_len = frame.len() as u64;
-                        group.write_frame(frame);
-                        metrics.frames_total.fetch_add(1, Ordering::Relaxed);
-                        metrics.bytes_total.fetch_add(frame_len, Ordering::Relaxed);
+                    loop {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+
+                        let mut group = track_producer.append_group();
+                        for _ in 0..config.group_size {
+                            let frame = generator.generate();
+                            let frame_len = frame.len() as u64;
+                            group.write_frame(frame);
+                            metrics.frames_total.fetch_add(1, Ordering::Relaxed);
+                            metrics.bytes_total.fetch_add(frame_len, Ordering::Relaxed);
+                        }
+                        group.close();
+                        metrics.groups_total.fetch_add(1, Ordering::Relaxed);
+
+                        tokio::time::sleep(interval).await;
                     }
-                    group.close();
-                    metrics.groups_total.fetch_add(1, Ordering::Relaxed);
-
-                    tokio::time::sleep(interval).await;
                 }
+
             }));
         }
 
