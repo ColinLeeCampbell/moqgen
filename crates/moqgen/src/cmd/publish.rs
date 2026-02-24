@@ -7,6 +7,7 @@ use clap::Parser;
 use moqgen_core::config::{OutputFormat, PayloadType, PublishConfig};
 use moqgen_core::metrics::PublishMetrics;
 use moqgen_core::publisher::PublisherWorker;
+use tokio_util::sync::CancellationToken;
 
 use crate::output::{print_json, print_publish_text, PublishReport};
 
@@ -28,8 +29,8 @@ pub struct PublishArgs {
     #[arg(long, default_value_t = 30.0)]
     pub rate: f64,
 
-    /// Frames per group
-    #[arg(long, default_value_t = 1)]
+    /// Frames per group (default 1000 for file mode, 1 for synthetic)
+    #[arg(long, default_value_t = 1000)]
     pub group_size: usize,
 
     /// Frame size in bytes
@@ -62,7 +63,7 @@ pub struct PublishArgs {
     pub static_dir: Option<PathBuf>,
 }
 
-pub async fn run(args: PublishArgs) -> anyhow::Result<()> {
+pub async fn run(args: PublishArgs, cancel: CancellationToken) -> anyhow::Result<()> {
     let output = parse_output_format(&args.output);
 
     let config = PublishConfig {
@@ -88,12 +89,16 @@ pub async fn run(args: PublishArgs) -> anyhow::Result<()> {
     let output_clone = output.clone();
     let interval_secs = args.metrics_interval;
     let duration_secs = args.duration;
+    let stats_cancel = cancel.clone();
     let stats_handle = tokio::spawn(async move {
         let start = Instant::now();
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
         ticker.tick().await; // skip first immediate tick
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = stats_cancel.cancelled() => break,
+            }
             let elapsed = start.elapsed().as_secs_f64();
             if elapsed > duration_secs as f64 + 1.0 {
                 break;
@@ -110,7 +115,7 @@ pub async fn run(args: PublishArgs) -> anyhow::Result<()> {
     // Spawn one worker per QUIC connection
     let mut handles = Vec::with_capacity(config.workers);
     for _i in 0..config.workers {
-        let worker = PublisherWorker::new(config.clone(), Arc::clone(&metrics));
+        let worker = PublisherWorker::new(config.clone(), Arc::clone(&metrics), cancel.clone());
         let url = args.relay.clone();
         handles.push(tokio::spawn(async move {
             worker.run(url).await
@@ -124,7 +129,8 @@ pub async fn run(args: PublishArgs) -> anyhow::Result<()> {
             .context("publisher worker failed")?;
     }
 
-    stats_handle.abort();
+    cancel.cancel();
+    let _ = stats_handle.await;
 
     // Print final summary
     let snap = metrics.snapshot();

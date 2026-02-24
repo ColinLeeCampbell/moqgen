@@ -6,6 +6,7 @@ use clap::Parser;
 use moqgen_core::config::{OutputFormat, ProbeConfig};
 use moqgen_core::metrics::{LatencyHistogram, PublishMetrics, SubscribeMetrics};
 use moqgen_core::probe::ProbeWorker;
+use tokio_util::sync::CancellationToken;
 
 use crate::cmd::publish::parse_output_format;
 use crate::output::{
@@ -52,7 +53,7 @@ pub struct ProbeArgs {
     pub metrics_interval: u64,
 }
 
-pub async fn run(args: ProbeArgs) -> anyhow::Result<()> {
+pub async fn run(args: ProbeArgs, cancel: CancellationToken) -> anyhow::Result<()> {
     let output = parse_output_format(&args.output);
 
     // Enforce minimum frame size for timestamp
@@ -81,13 +82,17 @@ pub async fn run(args: ProbeArgs) -> anyhow::Result<()> {
     let output_clone = output.clone();
     let interval_secs = args.metrics_interval;
     let duration_secs = args.duration;
+    let stats_cancel = cancel.clone();
 
     let stats_handle = tokio::spawn(async move {
         let start = Instant::now();
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
         ticker.tick().await;
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = stats_cancel.cancelled() => break,
+            }
             let elapsed = start.elapsed().as_secs_f64();
             if elapsed > duration_secs as f64 + 1.0 {
                 break;
@@ -124,13 +129,15 @@ pub async fn run(args: ProbeArgs) -> anyhow::Result<()> {
         Arc::clone(&pub_metrics),
         Arc::clone(&sub_metrics),
         Arc::clone(&latency),
+        cancel.clone(),
     );
     worker
         .run(args.relay.clone())
         .await
         .context("probe worker failed")?;
 
-    stats_handle.abort();
+    cancel.cancel();
+    let _ = stats_handle.await;
 
     // Final summary
     let elapsed = args.duration as f64;

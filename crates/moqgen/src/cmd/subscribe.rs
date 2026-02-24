@@ -7,6 +7,7 @@ use clap::Parser;
 use moqgen_core::config::{OutputFormat, SubscribeConfig};
 use moqgen_core::metrics::SubscribeMetrics;
 use moqgen_core::subscriber::SubscriberWorker;
+use tokio_util::sync::CancellationToken;
 
 use crate::cmd::publish::parse_output_format;
 use crate::output::{print_json, print_subscribe_text, SubscribeReport};
@@ -58,7 +59,7 @@ pub struct SubscribeArgs {
     pub output_dir: Option<PathBuf>,
 }
 
-pub async fn run(args: SubscribeArgs) -> anyhow::Result<()> {
+pub async fn run(args: SubscribeArgs, cancel: CancellationToken) -> anyhow::Result<()> {
     let output = parse_output_format(&args.output);
 
     let config = SubscribeConfig {
@@ -82,12 +83,16 @@ pub async fn run(args: SubscribeArgs) -> anyhow::Result<()> {
     let output_clone = output.clone();
     let interval_secs = args.metrics_interval;
     let duration_secs = args.duration;
+    let stats_cancel = cancel.clone();
     let stats_handle = tokio::spawn(async move {
         let start = Instant::now();
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
         ticker.tick().await;
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = stats_cancel.cancelled() => break,
+            }
             let elapsed = start.elapsed().as_secs_f64();
             if elapsed > duration_secs as f64 + 1.0 {
                 break;
@@ -101,13 +106,14 @@ pub async fn run(args: SubscribeArgs) -> anyhow::Result<()> {
         }
     });
 
-    let worker = SubscriberWorker::new(config, Arc::clone(&metrics));
+    let worker = SubscriberWorker::new(config, Arc::clone(&metrics), cancel.clone());
     worker
         .run(args.relay.clone())
         .await
         .context("subscriber worker failed")?;
 
-    stats_handle.abort();
+    cancel.cancel();
+    let _ = stats_handle.await;
 
     // Final summary
     let snap = metrics.snapshot();

@@ -1,25 +1,7 @@
 use std::path::Path;
 
-use bytes::Bytes;
-
-/// Returns (filename, content) pairs for every regular file in `dir`,
-/// sorted by filename, skipping hidden files (dot-prefixed).
-pub fn load_static_dir(dir: &Path) -> anyhow::Result<Vec<(String, Bytes)>> {
-    let mut entries = collect_filenames(dir)?;
-    entries.sort();
-
-    let mut result = Vec::with_capacity(entries.len());
-    for name in entries {
-        let path = dir.join(&name);
-        let content = std::fs::read(&path)
-            .map_err(|e| anyhow::anyhow!("failed to read '{}': {e}", path.display()))?;
-        result.push((name, Bytes::from(content)));
-    }
-    Ok(result)
-}
-
 /// Returns just filenames — used by subscriber to discover track names
-/// without loading file content.
+/// and publisher to resolve file paths, without loading file content.
 pub fn list_static_dir(dir: &Path) -> anyhow::Result<Vec<String>> {
     let mut entries = collect_filenames(dir)?;
     entries.sort();

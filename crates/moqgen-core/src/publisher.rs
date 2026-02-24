@@ -1,3 +1,5 @@
+use std::io::Read;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -5,22 +7,24 @@ use std::time::Duration;
 use anyhow::Context;
 use bytes::Bytes;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use url::Url;
 
 use crate::config::PublishConfig;
 use crate::generator::FrameGenerator;
 use crate::metrics::PublishMetrics;
-use crate::static_files::load_static_dir;
+use crate::static_files::list_static_dir;
 
 pub struct PublisherWorker {
     pub config: PublishConfig,
     pub metrics: Arc<PublishMetrics>,
+    pub cancel: CancellationToken,
 }
 
 impl PublisherWorker {
-    pub fn new(config: PublishConfig, metrics: Arc<PublishMetrics>) -> Self {
-        Self { config, metrics }
+    pub fn new(config: PublishConfig, metrics: Arc<PublishMetrics>, cancel: CancellationToken) -> Self {
+        Self { config, metrics, cancel }
     }
 
     pub async fn run(&self, url: Url) -> anyhow::Result<()> {
@@ -35,11 +39,14 @@ impl PublisherWorker {
             .create_broadcast(&self.config.broadcast)
             .with_context(|| format!("invalid broadcast path '{}'", self.config.broadcast))?;
 
-        // Build (track_name, file_bytes_or_None) pairs depending on mode
-        let track_entries: Vec<(String, Option<Bytes>)> = if let Some(ref dir) = self.config.static_dir {
-            let files = load_static_dir(dir)
-                .with_context(|| format!("load static dir '{}'", dir.display()))?;
-            files.into_iter().map(|(name, bytes)| (name, Some(bytes))).collect()
+        // Build (track_name, file_path_or_None) pairs depending on mode
+        let track_entries: Vec<(String, Option<PathBuf>)> = if let Some(ref dir) = self.config.static_dir {
+            let names = list_static_dir(dir)
+                .with_context(|| format!("list static dir '{}'", dir.display()))?;
+            names.into_iter().map(|name| {
+                let path = dir.join(&name);
+                (name, Some(path))
+            }).collect()
         } else {
             (0..self.config.tracks)
                 .map(|i| (format!("track-{i}"), None))
@@ -47,12 +54,12 @@ impl PublisherWorker {
         };
 
         // Pre-create all tracks in the broadcast
-        let mut track_producers: Vec<(String, Option<Bytes>, moq_lite::TrackProducer)> =
+        let mut track_producers: Vec<(String, Option<PathBuf>, moq_lite::TrackProducer)> =
             Vec::with_capacity(track_entries.len());
-        for (name, bytes) in track_entries {
+        for (name, path) in track_entries {
             let track = moq_lite::Track::new(name.clone());
             let producer = broadcast.create_track(track);
-            track_producers.push((name, bytes, producer));
+            track_producers.push((name, path, producer));
         }
 
         // Connect to the relay and start the session
@@ -68,21 +75,45 @@ impl PublisherWorker {
 
         // Spawn one task per track
         let mut handles = Vec::with_capacity(track_producers.len());
-        for (_track_name, file_bytes, mut track_producer) in track_producers {
+        for (track_name, file_path, mut track_producer) in track_producers {
             let metrics = Arc::clone(&self.metrics);
             let config = self.config.clone();
+            let cancel = self.cancel.clone();
 
             handles.push(tokio::spawn(async move {
-                if let Some(file_bytes) = file_bytes {
-                    // Static mode: loop sending file content chunked into frame_size groups
-                    loop {
-                        if Instant::now() >= deadline {
+                if let Some(file_path) = file_path {
+                    // Static mode: stream file from disk, group_size frames per group
+                    let chunk_size = config.frame_size.max(1);
+                    let frames_per_group = config.group_size.max(1);
+
+                    let file = match std::fs::File::open(&file_path) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            warn!("failed to open '{}': {e}", file_path.display());
+                            return;
+                        }
+                    };
+                    let mut reader = std::io::BufReader::new(file);
+                    let mut buf = vec![0u8; chunk_size];
+                    let mut eof = false;
+
+                    while !eof {
+                        if Instant::now() >= deadline || cancel.is_cancelled() {
                             break;
                         }
 
                         let mut group = track_producer.append_group();
-                        for chunk in file_bytes.chunks(config.frame_size.max(1)) {
-                            let frame = Bytes::copy_from_slice(chunk);
+                        for _ in 0..frames_per_group {
+                            let n = match reader.read(&mut buf) {
+                                Ok(0) => { eof = true; break; }
+                                Ok(n) => n,
+                                Err(e) => {
+                                    warn!("read error on '{track_name}': {e}");
+                                    eof = true;
+                                    break;
+                                }
+                            };
+                            let frame = Bytes::copy_from_slice(&buf[..n]);
                             let frame_len = frame.len() as u64;
                             group.write_frame(frame);
                             metrics.frames_total.fetch_add(1, Ordering::Relaxed);
@@ -91,7 +122,10 @@ impl PublisherWorker {
                         group.close();
                         metrics.groups_total.fetch_add(1, Ordering::Relaxed);
 
-                        tokio::time::sleep(interval).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(interval) => {}
+                            _ = cancel.cancelled() => break,
+                        }
                     }
                 } else {
                     // Synthetic mode: existing behaviour
@@ -99,7 +133,7 @@ impl PublisherWorker {
                         FrameGenerator::new(config.frame_size, config.payload_type.clone());
 
                     loop {
-                        if Instant::now() >= deadline {
+                        if Instant::now() >= deadline || cancel.is_cancelled() {
                             break;
                         }
 
@@ -114,7 +148,10 @@ impl PublisherWorker {
                         group.close();
                         metrics.groups_total.fetch_add(1, Ordering::Relaxed);
 
-                        tokio::time::sleep(interval).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(interval) => {}
+                            _ = cancel.cancelled() => break,
+                        }
                     }
                 }
 

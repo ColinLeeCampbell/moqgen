@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use url::Url;
 
@@ -17,6 +18,7 @@ pub struct ProbeWorker {
     pub pub_metrics: Arc<PublishMetrics>,
     pub sub_metrics: Arc<SubscribeMetrics>,
     pub latency: Arc<LatencyHistogram>,
+    pub cancel: CancellationToken,
 }
 
 impl ProbeWorker {
@@ -25,12 +27,14 @@ impl ProbeWorker {
         pub_metrics: Arc<PublishMetrics>,
         sub_metrics: Arc<SubscribeMetrics>,
         latency: Arc<LatencyHistogram>,
+        cancel: CancellationToken,
     ) -> Self {
         Self {
             config,
             pub_metrics,
             sub_metrics,
             latency,
+            cancel,
         }
     }
 
@@ -46,6 +50,7 @@ impl ProbeWorker {
         let pub_metrics = Arc::clone(&self.pub_metrics);
         let pub_insecure = self.config.insecure;
 
+        let cancel = self.cancel.clone();
         let pub_handle = tokio::spawn(async move {
             let result: anyhow::Result<()> = async {
                 let origin = moq_lite::Origin::produce();
@@ -70,10 +75,11 @@ impl ProbeWorker {
                 for mut track_producer in track_producers.drain(..) {
                     let pm = Arc::clone(&pub_metrics);
                     let fs = frame_size;
+                    let cancel = cancel.clone();
                     handles.push(tokio::spawn(async move {
                         let mut gen = FrameGenerator::new(fs, crate::config::PayloadType::Random);
                         loop {
-                            if tokio::time::Instant::now() >= deadline {
+                            if tokio::time::Instant::now() >= deadline || cancel.is_cancelled() {
                                 break;
                             }
                             let mut group = track_producer.append_group();
@@ -86,7 +92,10 @@ impl ProbeWorker {
                             pm.frames_total.fetch_add(1, Ordering::Relaxed);
                             pm.bytes_total.fetch_add(frame_len, Ordering::Relaxed);
 
-                            tokio::time::sleep(interval).await;
+                            tokio::select! {
+                                _ = tokio::time::sleep(interval) => {}
+                                _ = cancel.cancelled() => break,
+                            }
                         }
                     }));
                 }
@@ -94,6 +103,11 @@ impl ProbeWorker {
                 for h in handles {
                     let _ = h.await;
                 }
+
+                // Signal shutdown before _session drops so the subscriber
+                // treats the resulting transport errors as expected.
+                cancel.cancel();
+
                 Ok(())
             }
             .await;
@@ -117,7 +131,7 @@ impl ProbeWorker {
             output_dir: None,
         };
 
-        let sub_worker = SubscriberWorker::new(sub_config, Arc::clone(&self.sub_metrics))
+        let sub_worker = SubscriberWorker::new(sub_config, Arc::clone(&self.sub_metrics), self.cancel.clone())
             .with_latency(Arc::clone(&self.latency));
 
         let sub_url = url.clone();

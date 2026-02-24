@@ -1,9 +1,10 @@
+use std::io::Write;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use bytes::Bytes;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -18,14 +19,16 @@ pub struct SubscriberWorker {
     pub metrics: Arc<SubscribeMetrics>,
     /// Optional latency histogram — populated when used from probe mode.
     pub latency: Option<Arc<LatencyHistogram>>,
+    pub cancel: CancellationToken,
 }
 
 impl SubscriberWorker {
-    pub fn new(config: SubscribeConfig, metrics: Arc<SubscribeMetrics>) -> Self {
+    pub fn new(config: SubscribeConfig, metrics: Arc<SubscribeMetrics>, cancel: CancellationToken) -> Self {
         Self {
             config,
             metrics,
             latency: None,
+            cancel,
         }
     }
 
@@ -55,13 +58,21 @@ impl SubscriberWorker {
             + Duration::from_secs(self.config.duration_secs);
 
         // Wait for our target broadcast to be announced by the remote
-        let broadcast_consumer = tokio::time::timeout(
-            Duration::from_secs(self.config.duration_secs),
-            find_broadcast(&mut origin_consumer, &self.config.broadcast),
-        )
-        .await
-        .context("timed out waiting for broadcast announcement")?
-        .context("broadcast not found (connection dropped)")?;
+        let broadcast_consumer = tokio::select! {
+            result = tokio::time::timeout(
+                Duration::from_secs(self.config.duration_secs),
+                find_broadcast(&mut origin_consumer, &self.config.broadcast),
+            ) => {
+                result
+                    .context("timed out waiting for broadcast announcement")?
+                    .context("broadcast not found (connection dropped)")?
+            }
+            _ = self.cancel.cancelled() => {
+                debug!("subscriber cancelled while waiting for broadcast");
+                drop(_session);
+                return Ok(());
+            }
+        };
 
         info!("subscribed to broadcast '{}'", self.config.broadcast);
 
@@ -90,24 +101,47 @@ impl SubscriberWorker {
             let validate = self.config.validate;
             let expected_frame_size = self.config.frame_size;
             let output_dir = self.config.output_dir.clone();
+            let cancel = self.cancel.clone();
 
             handles.push(tokio::spawn(async move {
                 let mut last_seq: Option<u64> = None;
 
+                // Open file once before the group loop so all groups append
+                let mut file_writer = if let Some(ref out_dir) = output_dir {
+                    let out_path = out_dir.join(&track_name);
+                    match std::fs::File::create(&out_path) {
+                        Ok(f) => Some(std::io::BufWriter::new(f)),
+                        Err(e) => {
+                            warn!("failed to create '{}': {e}", out_path.display());
+                            metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 loop {
-                    if tokio::time::Instant::now() >= deadline {
+                    if tokio::time::Instant::now() >= deadline || cancel.is_cancelled() {
                         break;
                     }
 
-                    let mut group = match track_consumer.next_group().await {
+                    let mut group = match tokio::select! {
+                        result = track_consumer.next_group() => result,
+                        _ = cancel.cancelled() => break,
+                    } {
                         Ok(Some(g)) => g,
                         Ok(None) => {
                             debug!("track '{track_name}' closed cleanly");
                             break;
                         }
                         Err(e) => {
-                            warn!("track '{track_name}' error: {e}");
-                            metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                            if cancel.is_cancelled() {
+                                debug!("track '{track_name}' closed during shutdown");
+                            } else {
+                                warn!("track '{track_name}' error: {e}");
+                                metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                            }
                             break;
                         }
                     };
@@ -129,13 +163,6 @@ impl SubscriberWorker {
                     }
                     last_seq = Some(seq);
                     metrics.groups_total.fetch_add(1, Ordering::Relaxed);
-
-                    // Accumulate frames for file writing if output_dir is set
-                    let mut group_frames: Vec<Bytes> = if output_dir.is_some() {
-                        Vec::new()
-                    } else {
-                        Vec::new() // empty but we won't populate it when not needed
-                    };
 
                     loop {
                         let frame = match group.read_frame().await {
@@ -175,26 +202,22 @@ impl SubscriberWorker {
                         metrics.frames_total.fetch_add(1, Ordering::Relaxed);
                         metrics.bytes_total.fetch_add(frame_len, Ordering::Relaxed);
 
-                        if output_dir.is_some() {
-                            group_frames.push(frame);
+                        // Stream frame directly to disk
+                        if let Some(ref mut writer) = file_writer {
+                            if let Err(e) = writer.write_all(&frame) {
+                                warn!("failed to write frame for '{track_name}': {e}");
+                                metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                                file_writer = None; // stop trying to write
+                            }
                         }
                     }
+                }
 
-                    // Write reconstructed file after group is fully received
-                    if let Some(ref out_dir) = output_dir {
-                        let total_len: usize = group_frames.iter().map(|b| b.len()).sum();
-                        let mut file_data = Vec::with_capacity(total_len);
-                        for chunk in &group_frames {
-                            file_data.extend_from_slice(chunk);
-                        }
-                        let out_path = out_dir.join(&track_name);
-                        if let Err(e) = std::fs::write(&out_path, &file_data) {
-                            warn!(
-                                "failed to write '{}': {e}",
-                                out_path.display()
-                            );
-                            metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                        }
+                // Flush remaining buffered data to disk
+                if let Some(mut writer) = file_writer {
+                    if let Err(e) = writer.flush() {
+                        warn!("failed to flush file for '{track_name}': {e}");
+                        metrics.errors_total.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }));
